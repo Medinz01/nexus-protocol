@@ -4,36 +4,87 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/multiformats/go-multiaddr"
 )
 
-const chatProtocolID = "/nexus/chat/1.0.0"
+// ChatProtocolID is the unique identifier for our chat protocol.
+// It's capitalized to be public.
+const ChatProtocolID = "/nexus/chat/1.0.0"
+
+// bootstrapPeers are the public nodes we connect to for peer discovery.
+var bootstrapPeers = []string{
+	"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+	"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcUXa2kE4CRCS3iS0weA8EMvPkbEhwQroutvXaWp",
+}
+
+// ChatStreamHandler handles incoming chat messages.
+// It's capitalized to be public.
+func ChatStreamHandler(stream network.Stream) {
+	reader := bufio.NewReader(stream)
+	message, err := reader.ReadString('\n')
+	if err != nil {
+		fmt.Println("Error reading from stream:", err)
+		return
+	}
+	remotePeer := stream.Conn().RemotePeer()
+	fmt.Printf("Received message from %s: %s", remotePeer.ShortString(), message)
+	stream.Close()
+}
 
 // CreateHost initializes a new libp2p host.
-func CreateHost() {
-	// This is the simplest way to create a host.
-	// It will listen on a random TCP port on all available interfaces.
-	host, err := libp2p.New()
+func CreateHost(ctx context.Context) (host.Host, error) {
+	opts := []libp2p.Option{
+		libp2p.EnableHolePunching(),
+		libp2p.EnableRelay(),
+	}
+
+	host, err := libp2p.New(opts...)
 	if err != nil {
-		panic(err) // For a simple CLI, panicking on critical error is fine.
-	}
-	defer host.Close()
-
-	// Get the host's Peer ID and addresses.
-	// The Multiaddress format includes the Peer ID at the end.
-	host.SetStreamHandler(chatProtocolID, chatStreamHandler)
-	fmt.Println("Node is listening... Press CTRL+C to stop.")
-	for _, addr := range host.Addrs() {
-		fmt.Printf("  %s/p2p/%s\n", addr, host.ID())
+		return nil, err
 	}
 
-	// This part is important. It keeps the program running.
-	select {} // block forever
+	kademliaDHT, err := dht.New(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = kademliaDHT.Bootstrap(ctx); err != nil {
+		return nil, err
+	}
+
+	for _, peerAddrStr := range bootstrapPeers {
+		// FIX #1: Handle the error from NewMultiaddr before using its result.
+		maddr, err := multiaddr.NewMultiaddr(peerAddrStr)
+		if err != nil {
+			fmt.Println("Error parsing bootstrap peer address:", err)
+			continue
+		}
+		p, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			fmt.Println("Error getting peer info from address:", err)
+			continue
+		}
+
+		ctxWithTimeout, cancel := context.WithTimeout(ctx, 5*time.Second)
+		host.Connect(ctxWithTimeout, *p)
+		cancel()
+	}
+
+	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
+	dutil.Advertise(ctx, routingDiscovery, ChatProtocolID)
+
+	return host, nil
 }
+
 func PingPeer(targetAddress string) {
 	ctx := context.Background()
 
@@ -69,25 +120,6 @@ func PingPeer(targetAddress string) {
 	fmt.Println("✅ Connection established! Peer is online.")
 }
 
-// chatStreamHandler reads incoming messages and prints them to the console.
-func chatStreamHandler(stream network.Stream) {
-	// A buffered reader is useful for reading data line-by-line.
-	reader := bufio.NewReader(stream)
-
-	// Read the message from the stream.
-	message, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Println("Error reading from stream:", err)
-		return
-	}
-
-	// Print the message from the remote peer.
-	remotePeer := stream.Conn().RemotePeer()
-	fmt.Printf("Received message from %s: %s", remotePeer.ShortString(), message)
-
-	// Close the stream when we're done.
-	stream.Close()
-}
 func SendChatMessage(targetAddress string, message string) {
 	ctx := context.Background()
 	host, err := libp2p.New()
@@ -116,7 +148,7 @@ func SendChatMessage(targetAddress string, message string) {
 	}
 
 	// Open a new stream to the peer for our chat protocol.
-	stream, err := host.NewStream(ctx, peerInfo.ID, chatProtocolID)
+	stream, err := host.NewStream(ctx, peerInfo.ID, ChatProtocolID)
 	if err != nil {
 		fmt.Println("Failed to open stream:", err)
 		return
